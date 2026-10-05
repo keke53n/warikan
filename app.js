@@ -37,6 +37,9 @@ const ICONS = {
   copy: icon('<rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h8"/>'),
   line: icon('<path d="M4 5h16v11H9l-4 4v-4H4z"/>'),
   logout: icon('<path d="M15 4h3a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-3M10 17l5-5-5-5M15 12H4"/>'),
+  bell: icon('<path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9"/><path d="M10.3 21a1.94 1.94 0 0 0 3.4 0"/>'),
+  refresh: icon('<path d="M20 11a8 8 0 1 0-2.3 5.7M20 4v7h-7"/>'),
+  camera: icon('<path d="M4 8h3l2-3h6l2 3h3v11H4z"/><circle cx="12" cy="13" r="3.5"/>'),
 };
 const TAB_ICONS = {
   records: icon('<path d="M8 6h12M8 12h12M8 18h12M4 6h.01M4 12h.01M4 18h.01"/>'),
@@ -229,8 +232,53 @@ const state = {
   invite: null,
   loginError: '',
   loggingIn: false,
+  unread: 0,
+  version: '',
+  chartFilter: 'all',
+  includeFixed: true,
 };
+const photoCache = {};
 const loadSeq = { home: 0, rooms: {} };
+
+// ===== 画面側のキャッシュ(前回の表示をスマホに保存し、開いた瞬間に出す) =====
+
+const CACHE_KEY = 'warikan.cache.v1';
+const inFlight = { home: 0, rooms: {} };
+let syncingCount = 0;
+let cacheTimer = null;
+
+function restoreLocalCache() {
+  const saved = parseJson(storageGet(CACHE_KEY));
+  if (!saved || !state.user || saved.userId !== state.user.userId) return;
+  state.rooms = saved.rooms || {};
+  state.home = saved.home && saved.home.month === state.month ? saved.home : null;
+}
+
+function saveLocalCache() {
+  clearTimeout(cacheTimer);
+  cacheTimer = setTimeout(function () {
+    if (!state.user) return;
+    try {
+      window.localStorage.setItem(CACHE_KEY, JSON.stringify({ userId: state.user.userId, home: state.home, rooms: state.rooms, savedAt: Date.now() }));
+    } catch (e) {
+      // 保存できる量を超えたときは、キャッシュを使わない(毎回読み込むだけで、動作には影響しない)
+      try { window.localStorage.removeItem(CACHE_KEY); } catch (e2) { /* 何もしない */ }
+    }
+  }, 300);
+}
+
+// 最新に差し替えている間は、画面の上に「更新中」を出す
+function setSyncing(delta) {
+  syncingCount = Math.max(0, syncingCount + delta);
+  document.body.classList.toggle('syncing', syncingCount > 0);
+}
+
+// 表示中の数字をもとにする操作(精算の開始など)は、最新への差し替えが終わるまで待ってもらう
+function staleGuard(roomId) {
+  if (!inFlight.rooms[roomId]) return false;
+  showToast('最新の状態に更新しています。少し待ってから、もう一度押してください', 'error');
+  return true;
+}
 
 function saveSession(token, user) {
   state.token = token;
@@ -243,8 +291,10 @@ function clearSession() {
   state.user = null;
   state.home = null;
   state.rooms = {};
+  state.version = '';
   storageSet(STORAGE_KEYS.token, null);
   storageSet(STORAGE_KEYS.user, null);
+  storageSet(CACHE_KEY, null);
 }
 function currentRoom() {
   return state.view.name === 'room' ? state.rooms[state.view.roomId] : null;
@@ -319,32 +369,70 @@ async function saveAction(action, params, opts) {
 
 async function loadHome() {
   const seq = ++loadSeq.home;
+  inFlight.home++;
+  setSyncing(1);
   try {
     const data = await api('home', { month: state.month });
     if (seq !== loadSeq.home) return;
     state.home = data;
+    if (data.unread !== undefined) state.unread = data.unread;
+    if (data.version) state.version = data.version;
     if (data.displayName && state.user) state.user.displayName = data.displayName;
+    saveLocalCache();
     if (state.view.name === 'home') render();
+    prefetchRooms();
   } catch (e) {
     if (e.code !== 'AUTH_REQUIRED') showToast(e.message, 'error');
+  } finally {
+    inFlight.home--;
+    setSyncing(-1);
   }
 }
 
-async function loadRoom(roomId) {
+// ホームを開いたら、裏で各ルームの最新も取っておく(ルームを開いたときにすぐ出せるように)
+let prefetching = false;
+async function prefetchRooms() {
+  if (prefetching || !state.home) return;
+  prefetching = true;
+  try {
+    const version = state.home.version;
+    const targets = state.home.rooms.filter(function (r) { return !r.archived; }).map(function (r) { return r.roomId; })
+      .filter(function (id) { return !state.rooms[id] || state.rooms[id].version !== version; });
+    for (let i = 0; i < targets.length; i++) {
+      if (!state.token) break;
+      await loadRoom(targets[i], { quiet: true });
+    }
+  } finally {
+    prefetching = false;
+  }
+}
+
+async function loadRoom(roomId, opts) {
+  opts = opts || {};
   const seq = (loadSeq.rooms[roomId] || 0) + 1;
   loadSeq.rooms[roomId] = seq;
+  inFlight.rooms[roomId] = (inFlight.rooms[roomId] || 0) + 1;
+  if (!opts.quiet) setSyncing(1);
   try {
     const data = await api('getRoom', { roomId: roomId });
     if (loadSeq.rooms[roomId] !== seq) return;
     state.rooms[roomId] = data;
+    if (data.unread !== undefined) state.unread = data.unread;
+    if (data.version) state.version = data.version;
+    saveLocalCache();
     if (state.view.name === 'room' && state.view.roomId === roomId) render();
   } catch (e) {
-    if (e.code === 'AUTH_REQUIRED') return;
+    if (e.code === 'AUTH_REQUIRED' || opts.quiet) return;
     showToast(e.message, 'error');
     if ((e.code === 'NOT_FOUND' || e.code === 'FORBIDDEN') && state.view.roomId === roomId) {
       delete state.rooms[roomId];
+      saveLocalCache();
       go('#/');
     }
+  } finally {
+    inFlight.rooms[roomId]--;
+    if (!inFlight.rooms[roomId]) delete inFlight.rooms[roomId];
+    if (!opts.quiet) setSyncing(-1);
   }
 }
 
@@ -377,6 +465,37 @@ async function loadInvite(token) {
     if (state.invite) state.invite.error = e.message;
   }
   if (state.view.name === 'join') render();
+}
+
+// ===== 変更の自動チェック(20秒ごと、またはアプリに戻ってきたとき) =====
+
+const CHECK_INTERVAL_MS = 20000;
+let checking = false;
+
+async function checkForChanges() {
+  if (checking || !state.token || document.hidden) return;
+  if (state.view.name !== 'home' && state.view.name !== 'room') return;
+  const toast = document.getElementById('toast');
+  if (toast && toast.className.indexOf('busy') >= 0) return;
+  checking = true;
+  try {
+    const res = await api('check', {});
+    if (res.unread !== state.unread) {
+      state.unread = res.unread;
+      refreshBell();
+    }
+    if (!state.version) {
+      state.version = res.version;
+    } else if (res.version !== state.version) {
+      state.version = res.version;
+      if (state.view.name === 'home') loadHome();
+      else if (state.view.name === 'room') loadRoom(state.view.roomId);
+    }
+  } catch (e) {
+    // 通信できなかったときは、次の確認でやり直す
+  } finally {
+    checking = false;
+  }
 }
 
 // ===== Googleでログイン =====
@@ -568,7 +687,7 @@ function renderJoin() {
 function renderHome() {
   const h = state.home;
   const header = appHeader('割り勘アプリ', null,
-    '<button type="button" class="icon-btn" data-action="logout" aria-label="ログアウト" title="ログアウト">' + ICONS.logout + '</button>');
+    bellButton() + '<button type="button" class="icon-btn" data-action="logout" aria-label="ログアウト" title="ログアウト">' + ICONS.logout + '</button>');
   if (!h) return header + '<main class="page">' + monthSwitcher() + '<p class="loading">読み込んでいます…</p></main>';
 
   const active = h.rooms.filter(function (r) { return !r.archived; });
@@ -580,6 +699,7 @@ function renderHome() {
     '<dl class="summary-split"><div><dt>受け取る予定</dt><dd>' + yen(h.totals.toReceive) + '</dd></div>' +
     '<div><dt>払う予定</dt><dd>' + yen(h.totals.toPay) + '</dd></div></dl>' +
     '</section>' +
+    homeChartsHtml(h) +
     '<section class="section"><div class="section-head"><h2 class="section-title">ルーム</h2>' +
     '<button type="button" class="btn small" data-action="create-room">' + ICONS.plus + 'ルームを作る</button></div>' +
     (active.length
@@ -612,7 +732,8 @@ function renderRoom() {
   const v = state.view;
   const room = state.rooms[v.roomId];
   if (!room) return appHeader('読み込み中', '#/') + '<main class="page"><p class="loading">読み込んでいます…</p></main>';
-  const header = appHeader(room.room.name, '#/', room.room.archived ? '<span class="chip">アーカイブ中</span>' : '');
+  const header = appHeader(room.room.name, '#/', (room.room.archived ? '<span class="chip">アーカイブ中</span>' : '') +
+    '<button type="button" class="icon-btn" data-action="refresh-room" aria-label="再読み込み" title="再読み込み">' + ICONS.refresh + '</button>' + bellButton());
   const panel = function (id) {
     if (id === 'records') return renderRecords(room);
     if (id === 'settle') return renderSettle(room);
@@ -672,6 +793,7 @@ function paymentRow(room, p) {
   }
   const tags = (p.fixedCostId ? '<span class="tag">固定費</span>' : '') +
     (p.parts && p.parts.length ? '<span class="tag">分割</span>' : '') +
+    (p.photoIds && p.photoIds.length ? '<span class="tag">写真' + p.photoIds.length + '</span>' : '') +
     (needsKakeiboCheck(room, p) ? '<span class="tag warn">カテゴリを確認</span>' : '');
   return '<li><button type="button" class="row record" data-action="open-payment" data-id="' + esc(p.paymentId) + '">' +
     '<span class="row-date">' + esc(dateLabel(p.date)) + '</span>' +
@@ -860,6 +982,7 @@ function renderSummary(room) {
     '<dl class="summary-split three">' + ['settled', 'settling', 'open'].map(function (k) {
       return '<div><dt><span class="dot ' + k + '"></span>' + STATUS_LABELS[k] + '</dt><dd>' + yen(byStatus[k]) + '</dd></div>';
     }).join('') + '</dl></section>' +
+    roomChartsHtml(room) +
     '<section class="section"><h3 class="section-title">1人ずつ</h3><div class="table-wrap"><table class="table">' +
     '<thead><tr><th scope="col">メンバー</th><th scope="col">負担額</th><th scope="col">立替額</th></tr></thead><tbody>' +
     rows.map(function (m) {
@@ -1128,6 +1251,9 @@ function openPaymentForm(roomId, existing, draft) {
     }).join('') + '</div><p class="hint" data-per-person></p></div>' +
     '<label class="field"><span>メモ</span><textarea name="memo" rows="2" maxlength="500">' + esc(values.memo) + '</textarea></label>' +
     '</fieldset>' +
+    '<div class="field"><span>レシート写真(3枚まで)</span><div class="photos" data-photos></div>' +
+    '<input type="file" accept="image/*" data-photo-input hidden>' +
+    '<div><button type="button" class="btn small ghost" data-form-action="add-photo">' + ICONS.camera + '写真を追加</button></div></div>' +
     '<p class="form-error" role="alert"></p>' +
     '<div class="form-actions">' +
     (locked
@@ -1205,6 +1331,64 @@ function openPaymentForm(roomId, existing, draft) {
     form.addEventListener('change', updateHints);
     updateHints();
 
+    // レシート写真。保存済みの支払いはその場で保存し、新しい支払いは登録したあとに保存する
+    let photoIds = existing ? (existing.photoIds || []).slice() : [];
+    const pending = (values.pendingPhotos || []).slice();
+    const photosEl = form.querySelector('[data-photos]');
+    const photoInput = form.querySelector('[data-photo-input]');
+    const addPhotoBtn = form.querySelector('[data-form-action="add-photo"]');
+    const renderPhotos = function () {
+      photosEl.innerHTML = photoIds.map(function (id) {
+        return '<div class="photo"><img alt="レシート写真" data-photo-id="' + esc(id) + '"' + (photoCache[id] ? ' src="' + photoCache[id] + '"' : '') + '>' +
+          '<button type="button" class="photo-del" data-form-action="del-photo" data-id="' + esc(id) + '" aria-label="この写真を削除">' + ICONS.close + '</button></div>';
+      }).join('') + pending.map(function (url, i) {
+        return '<div class="photo pending"><img alt="保存前のレシート写真" src="' + url + '"><span class="photo-badge">保存前</span>' +
+          '<button type="button" class="photo-del" data-form-action="del-pending" data-index="' + i + '" aria-label="この写真を外す">' + ICONS.close + '</button></div>';
+      }).join('');
+      addPhotoBtn.hidden = photoIds.length + pending.length >= 3;
+      photoIds.forEach(function (id) {
+        if (photoCache[id]) return;
+        api('getPhoto', { paymentId: existing.paymentId, photoId: id }).then(function (res) {
+          photoCache[id] = res.dataUrl;
+          const img = photosEl.querySelector('img[data-photo-id="' + id + '"]');
+          if (img) img.src = res.dataUrl;
+        }).catch(function () { /* 読み込めない写真は空のまま */ });
+      });
+    };
+    renderPhotos();
+    photosEl.addEventListener('click', function (e) {
+      const img = e.target.closest('img');
+      if (img && img.getAttribute('src')) openLightbox(img.getAttribute('src'));
+    });
+    photoInput.addEventListener('change', async function () {
+      const file = photoInput.files && photoInput.files[0];
+      photoInput.value = '';
+      if (!file) return;
+      let url;
+      try {
+        url = await compressImage(file);
+      } catch (err) {
+        showToast(err.message, 'error');
+        return;
+      }
+      if (!existing) {
+        pending.push(url);
+        renderPhotos();
+        return;
+      }
+      showToast('写真を保存しています…', 'busy');
+      try {
+        const res = await api('uploadPhoto', { paymentId: existing.paymentId, dataUrl: url });
+        res.photoIds.filter(function (id) { return photoIds.indexOf(id) < 0; }).forEach(function (id) { photoCache[id] = url; });
+        photoIds = res.photoIds;
+        renderPhotos();
+        showToast('写真を保存しました', 'ok');
+        loadRoom(roomId);
+      } catch (err) {
+        if (err.code !== 'AUTH_REQUIRED') showToast(err.message, 'error');
+      }
+    });
+
     form.addEventListener('submit', function (e) {
       e.preventDefault();
       if (locked) return;
@@ -1223,11 +1407,15 @@ function openPaymentForm(roomId, existing, draft) {
         : !v.participantMemberIds.length ? '対象メンバーを1人以上選んでください'
         : '';
       if (error) { form.querySelector('.form-error').textContent = error; return; }
+      const pendingCopy = pending.slice();
       closeSheet();
       saveAction('savePayment', Object.assign({ roomId: roomId, paymentId: existing ? existing.paymentId : '' }, v), {
         roomId: roomId,
         success: existing ? '支払いを直しました' : '支払いを登録しました',
-        reopen: function () { openPaymentForm(roomId, existing, v); },
+        reopen: function () { openPaymentForm(roomId, existing, Object.assign({}, v, { pendingPhotos: pendingCopy })); },
+        after: function (data) {
+          if (!existing && data && data.paymentId && pendingCopy.length) uploadPendingPhotos(roomId, data.paymentId, pendingCopy);
+        },
       });
     });
 
@@ -1235,6 +1423,29 @@ function openPaymentForm(roomId, existing, draft) {
       const btn = e.target.closest('[data-form-action]');
       if (!btn) return;
       const act = btn.dataset.formAction;
+      if (act === 'add-photo') {
+        photoInput.click();
+        return;
+      }
+      if (act === 'del-pending') {
+        pending.splice(Number(btn.dataset.index), 1);
+        renderPhotos();
+        return;
+      }
+      if (act === 'del-photo') {
+        if (!window.confirm('この写真を削除しますか?')) return;
+        showToast('写真を削除しています…', 'busy');
+        try {
+          const res = await api('deletePhoto', { paymentId: existing.paymentId, photoId: btn.dataset.id });
+          photoIds = res.photoIds;
+          renderPhotos();
+          showToast('写真を削除しました', 'ok');
+          loadRoom(roomId);
+        } catch (err) {
+          if (err.code !== 'AUTH_REQUIRED') showToast(err.message, 'error');
+        }
+        return;
+      }
       if (act === 'add-part') {
         const v = read();
         const taken = [v.categoryId].concat(v.parts.map(function (x) { return x.categoryId; }));
@@ -1253,6 +1464,7 @@ function openPaymentForm(roomId, existing, draft) {
         const ok = await confirmSheet('支払いを削除', '「' + esc(existing.title) + ' ' + yen(existing.amount) + '」を削除します。', '削除する', true);
         if (ok) saveAction('deletePayment', { paymentId: existing.paymentId }, { roomId: roomId, success: '支払いを削除しました' });
       } else if (act === 'settle-this') {
+        if (staleGuard(roomId)) return;
         const preview = planTransfers(computeBalances([existing], []), memberOrder(room));
         const ok = await confirmSheet('この支払いを精算', previewHtml(room, preview) +
           '<p class="muted small">保存済みの内容で精算します。直した内容は、先に保存してください。</p>', '精算を始める', false);
@@ -1636,6 +1848,8 @@ function describeHistory(room, h) {
     case 'category:update': return 'カテゴリ「' + (a.name || '') + '」を変更しました';
     case 'payment:create': return '支払い' + pay(a) + 'を登録しました';
     case 'payment:update': return '支払い' + pay(a) + 'を直しました';
+    case 'payment:photo_add': return '支払い「' + (a.title || '') + '」に写真を追加しました';
+    case 'payment:photo_delete': return '支払い「' + (b.title || '') + '」の写真を削除しました';
     case 'payment:delete': return '支払い' + pay(b) + 'を削除しました';
     case 'transfer:create': return '受け渡し' + tr(a) + 'を記録しました';
     case 'transfer:update': return '受け渡し' + tr(a) + 'を直しました';
@@ -1676,6 +1890,300 @@ async function showHistory(roomId) {
       if (body) body.innerHTML = '<p class="notice error">' + esc(e.message) + '</p>';
     }
   }
+}
+
+// ===== アプリ内の通知 =====
+
+function bellButton() {
+  const n = state.unread || 0;
+  return '<button type="button" class="icon-btn bell" data-action="open-notifications" aria-label="お知らせ' + (n ? '(未読' + n + '件)' : '') + '">' +
+    ICONS.bell + (n ? '<span class="bell-count">' + (n > 99 ? '99+' : n) + '</span>' : '') + '</button>';
+}
+
+function refreshBell() {
+  document.querySelectorAll('[data-action="open-notifications"]').forEach(function (el) { el.outerHTML = bellButton(); });
+}
+
+function sheetBody() {
+  return document.querySelector('#sheet-root .sheet-body');
+}
+
+async function openNotifications() {
+  openSheet('お知らせ', '<p class="loading">読み込んでいます…</p>');
+  let data;
+  try {
+    data = await api('listNotifications', {});
+  } catch (e) {
+    const failed = sheetBody();
+    if (failed && e.code !== 'AUTH_REQUIRED') failed.innerHTML = '<p class="notice error">' + esc(e.message) + '</p>';
+    return;
+  }
+  const body = sheetBody();
+  if (!body) return;
+  body.innerHTML = (data.items.length
+    ? '<ul class="notice-list">' + data.items.map(function (n) {
+        return '<li><button type="button" class="notice-item' + (n.read ? '' : ' unread') + '" data-room="' + esc(n.roomId) + '">' +
+          '<span class="notice-text">' + esc(n.message) + '</span>' +
+          '<span class="notice-meta">' + esc(dateTimeLabel(n.createdAt)) + (n.roomName ? '・' + esc(n.roomName) : '') + '</span></button></li>';
+      }).join('') + '</ul>'
+    : '<p class="empty">お知らせはまだありません。</p>') +
+    '<div class="form-actions"><button type="button" class="btn" data-open-settings>通知の設定</button></div>';
+  body.addEventListener('click', function (e) {
+    if (e.target.closest('[data-open-settings]')) {
+      openNotifySettings();
+      return;
+    }
+    const item = e.target.closest('[data-room]');
+    if (item && item.dataset.room) {
+      closeSheet();
+      go('#/room/' + encodeURIComponent(item.dataset.room) + '/records');
+    }
+  });
+  if (data.unread) api('markNotificationsRead', {}).catch(function () { /* 次に開いたときにまた既読にする */ });
+  state.unread = 0;
+  refreshBell();
+}
+
+async function openNotifySettings() {
+  openSheet('通知の設定', '<p class="loading">読み込んでいます…</p>');
+  let settings;
+  try {
+    settings = await api('getNotifySettings', {});
+  } catch (e) {
+    const failed = sheetBody();
+    if (failed && e.code !== 'AUTH_REQUIRED') failed.innerHTML = '<p class="notice error">' + esc(e.message) + '</p>';
+    return;
+  }
+  const body = sheetBody();
+  if (!body) return;
+  const labels = { record: '支払い・受け渡しの追加や変更(固定費の自動登録を含む)', settlement: '精算の開始', paid: '送金の記録', reminder: '月末の未精算リマインド' };
+  body.innerHTML = '<form class="form" id="notify-form"><p class="sheet-message">受け取るお知らせを選んでください。自分がした操作は、もともと届きません。</p>' +
+    Object.keys(labels).map(function (k) {
+      return '<label class="check-line"><input type="checkbox" name="' + k + '"' + (settings[k] ? ' checked' : '') + '><span>' + esc(labels[k]) + '</span></label>';
+    }).join('') +
+    '<div class="form-actions"><button type="submit" class="btn primary">保存する</button></div></form>';
+  const form = body.querySelector('#notify-form');
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    const chosen = {};
+    Object.keys(labels).forEach(function (k) { chosen[k] = form.elements[k].checked; });
+    closeSheet();
+    saveAction('saveNotifySettings', { settings: chosen }, { success: '通知の設定を保存しました' });
+  });
+}
+
+// ===== レシート写真 =====
+
+// 送る前に、長い辺が1600pxになるよう小さくしてJPEGにする(できない環境ではそのまま)
+function compressImage(file) {
+  return new Promise(function (resolve, reject) {
+    const reader = new FileReader();
+    reader.onerror = function () { reject(new Error('写真を読み込めませんでした')); };
+    reader.onload = function () {
+      const original = String(reader.result);
+      const canvas = document.createElement('canvas');
+      let ctx = null;
+      try { ctx = canvas.getContext ? canvas.getContext('2d') : null; } catch (e) { ctx = null; }
+      if (!ctx) { resolve(original); return; }
+      const img = new Image();
+      img.onload = function () {
+        const scale = Math.min(1, 1600 / Math.max(img.width, img.height));
+        canvas.width = Math.max(1, Math.round(img.width * scale));
+        canvas.height = Math.max(1, Math.round(img.height * scale));
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL('image/jpeg', 0.8));
+      };
+      img.onerror = function () { resolve(original); };
+      img.src = original;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+async function uploadPendingPhotos(roomId, paymentId, list) {
+  showToast('写真を保存しています…', 'busy');
+  try {
+    for (let i = 0; i < list.length; i++) {
+      await api('uploadPhoto', { paymentId: paymentId, dataUrl: list[i] });
+    }
+    await loadRoom(roomId);
+    showToast('写真を保存しました', 'ok');
+  } catch (e) {
+    if (e.code !== 'AUTH_REQUIRED') showToast('写真を保存できませんでした:' + e.message, 'error');
+  }
+}
+
+function openLightbox(src) {
+  const box = document.createElement('div');
+  box.className = 'lightbox';
+  box.setAttribute('role', 'dialog');
+  box.setAttribute('aria-label', 'レシート写真');
+  box.innerHTML = '<img alt="レシート写真"><button type="button" class="icon-btn lightbox-close" aria-label="閉じる">' + ICONS.close + '</button>';
+  box.querySelector('img').src = src;
+  box.addEventListener('click', function () { box.remove(); });
+  document.body.appendChild(box);
+}
+
+// ===== グラフ =====
+
+const CHART_COLORS = { other: '#6f86d6', food: '#2f9e7a', dining: '#e0893b', rent: '#8a6fc4', gas: '#c9a227', electric: '#3fa0c9', water: '#5bb7a6', none: '#9aa6a8' };
+const EXTRA_COLORS = ['#b07aa1', '#7a9a3a', '#a0705a', '#4f7cac'];
+const GROUP_COLORS = ['#1f7a68', '#e0893b', '#6f86d6', '#c9a227', '#c45a8a', '#3fa0c9'];
+const FIXED_KEYS = ['rent', 'gas', 'electric', 'water'];
+const KEY_NAMES = { other: '日用品・家具家電', food: '食費・自炊', dining: '外食・嗜好品', rent: '家賃', gas: 'ガス', electric: '電気', water: '水道', none: 'その他' };
+
+function lastMonths(endMonth, count) {
+  const list = [];
+  for (let i = count - 1; i >= 0; i--) list.push(shiftMonth(endMonth, -i));
+  return list;
+}
+
+function shortYen(n) {
+  return n >= 10000 ? (Math.round(n / 1000) / 10) + '万' : yen(n);
+}
+
+// 1件の支払いを、カテゴリごとの金額に分ける(分割した分を含む)
+function partsOf(p) {
+  const extra = (p.parts || []).map(function (x) { return { categoryId: x.categoryId, amount: x.amount }; });
+  const used = sum(extra.map(function (x) { return x.amount; }));
+  return [{ categoryId: p.categoryId, amount: p.amount - used }].concat(extra).filter(function (x) { return x.amount > 0; });
+}
+
+function categoryColor(room, categoryId) {
+  const c = categoryOf(room, categoryId);
+  if (!c) return CHART_COLORS.none;
+  if (c.kakeiboKey) return CHART_COLORS[c.kakeiboKey];
+  const others = room.categories.filter(function (x) { return !x.kakeiboKey; });
+  return EXTRA_COLORS[Math.max(0, others.indexOf(c)) % EXTRA_COLORS.length];
+}
+
+function hbarChart(rows) {
+  const total = sum(rows.map(function (r) { return r.amount; }));
+  if (!total) return '<p class="empty">この月の記録はありません。</p>';
+  const max = Math.max.apply(null, rows.map(function (r) { return r.amount; }));
+  return '<div class="hbars">' + rows.map(function (r) {
+    return '<div class="hbar"><span class="hbar-label"><span class="dot" style="background:' + r.color + '"></span>' + esc(r.label) + '</span>' +
+      '<span class="hbar-track"><span class="hbar-fill" style="width:' + (r.amount / max * 100).toFixed(1) + '%;background:' + r.color + '"></span></span>' +
+      '<span class="hbar-value">' + yen(r.amount) + '<small>' + Math.round(r.amount / total * 100) + '%</small></span></div>';
+  }).join('') + '</div>';
+}
+
+// 月ごとの積み上げ棒グラフ。series は [{ label, color, values: { 'yyyy-MM': 金額 } }]
+function columnChart(months, series, label) {
+  const totals = months.map(function (m) { return sum(series.map(function (s) { return s.values[m] || 0; })); });
+  const max = Math.max.apply(null, [1].concat(totals));
+  const shown = series.filter(function (s) { return months.some(function (m) { return s.values[m]; }); });
+  if (!shown.length) return '<p class="empty">この期間の記録はありません。</p>';
+  return '<div class="cols" role="img" aria-label="' + esc(label) + '">' + months.map(function (m, i) {
+    return '<div class="col" title="' + esc(monthLabel(m)) + ' ' + yen(totals[i]) + '">' +
+      '<span class="col-total">' + (totals[i] ? shortYen(totals[i]) : '') + '</span>' +
+      '<div class="col-area"><div class="col-bar" style="height:' + (totals[i] / max * 100).toFixed(1) + '%">' +
+      shown.map(function (s) {
+        const v = s.values[m] || 0;
+        return v ? '<span style="height:' + (v / totals[i] * 100).toFixed(2) + '%;background:' + s.color + '"></span>' : '';
+      }).join('') + '</div></div>' +
+      '<span class="col-label' + (m === state.month ? ' current' : '') + '">' + Number(m.slice(5)) + '月</span></div>';
+  }).join('') + '</div>' +
+    '<div class="legend">' + shown.map(function (s) {
+      return '<span class="legend-item"><span class="dot" style="background:' + s.color + '"></span>' + esc(s.label) + '</span>';
+    }).join('') + '</div>';
+}
+
+function fixedToggle() {
+  return '<button type="button" class="chip-switch' + (state.includeFixed ? ' on' : '') + '" data-action="toggle-fixed" aria-pressed="' + state.includeFixed + '">' +
+    '固定費を' + (state.includeFixed ? '含める' : '外す') + '</button>';
+}
+
+function roomChartsHtml(room) {
+  const filters = [{ value: 'all', label: '全体' }, { value: 'shared', label: '共同' }].concat(room.members.filter(function (m) { return !m.left; }).map(function (m) {
+    return { value: m.memberId, label: m.displayName };
+  }));
+  if (!filters.some(function (f) { return f.value === state.chartFilter; })) state.chartFilter = 'all';
+  const filter = state.chartFilter;
+  const picked = room.payments.filter(function (p) {
+    if (filter === 'all') return true;
+    if (filter === 'shared') return p.shares.length >= 2;
+    return p.shares.length === 1 && p.shares[0].memberId === filter;
+  });
+  const isFixed = function (categoryId) {
+    const c = categoryOf(room, categoryId);
+    return !!c && FIXED_KEYS.indexOf(c.kakeiboKey) >= 0;
+  };
+  const months = lastMonths(state.month, 12);
+
+  // 今月のカテゴリ別
+  const byCategory = {};
+  picked.filter(function (p) { return String(p.date).slice(0, 7) === state.month; }).forEach(function (p) {
+    partsOf(p).forEach(function (x) { byCategory[x.categoryId] = (byCategory[x.categoryId] || 0) + x.amount; });
+  });
+  const rows = Object.keys(byCategory).map(function (id) {
+    const c = categoryOf(room, id);
+    return { label: c ? c.name : 'カテゴリなし', amount: byCategory[id], color: categoryColor(room, id) };
+  }).sort(function (a, b) { return b.amount - a.amount; });
+
+  // 直近12か月(カテゴリ別)
+  const seriesMap = {};
+  picked.forEach(function (p) {
+    const m = String(p.date).slice(0, 7);
+    if (months.indexOf(m) < 0) return;
+    partsOf(p).forEach(function (x) {
+      if (!state.includeFixed && isFixed(x.categoryId)) return;
+      const key = x.categoryId || '';
+      const s = (seriesMap[key] = seriesMap[key] || { values: {} });
+      s.values[m] = (s.values[m] || 0) + x.amount;
+    });
+  });
+  const order = room.categories.map(function (c) { return c.categoryId; }).concat(['']);
+  const trend = order.filter(function (id) { return seriesMap[id]; }).map(function (id) {
+    const c = categoryOf(room, id);
+    return { label: c ? c.name : 'カテゴリなし', color: categoryColor(room, id), values: seriesMap[id].values };
+  });
+
+  // 共同と個人の推移(この切り替えに関係なく、すべての支払いから)
+  const groups = [{ key: 'shared', label: '共同', values: {} }].concat(room.members.map(function (m) {
+    return { key: m.memberId, label: m.displayName + 'の個人', values: {} };
+  }));
+  room.payments.forEach(function (p) {
+    const m = String(p.date).slice(0, 7);
+    if (months.indexOf(m) < 0) return;
+    const key = p.shares.length >= 2 ? 'shared' : (p.shares.length === 1 ? p.shares[0].memberId : '');
+    const g = groups.find(function (x) { return x.key === key; });
+    if (!g) return;
+    const amount = sum(partsOf(p).filter(function (x) { return state.includeFixed || !isFixed(x.categoryId); }).map(function (x) { return x.amount; }));
+    g.values[m] = (g.values[m] || 0) + amount;
+  });
+  groups.forEach(function (g, i) { g.color = GROUP_COLORS[i % GROUP_COLORS.length]; });
+
+  return '<section class="section"><div class="section-head"><h3 class="section-title">グラフ</h3></div>' +
+    '<div class="filter-chips" role="group" aria-label="グラフの対象">' + filters.map(function (f) {
+      return '<button type="button" class="filter-chip' + (f.value === filter ? ' active' : '') + '" data-action="chart-filter" data-value="' + esc(f.value) + '" aria-pressed="' + (f.value === filter) + '">' + esc(f.label) + '</button>';
+    }).join('') + '</div>' +
+    '<h4 class="chart-title">' + esc(monthLabel(state.month)) + 'のカテゴリ別</h4>' + hbarChart(rows) +
+    '<div class="chart-head"><h4 class="chart-title">直近12か月の推移</h4>' + fixedToggle() + '</div>' +
+    columnChart(months, trend, '直近12か月の推移') +
+    '<div class="chart-head"><h4 class="chart-title">共同と個人の推移</h4></div>' +
+    columnChart(months, groups, '共同と個人の推移') +
+    '</section>';
+}
+
+function homeChartsHtml(h) {
+  const stats = h.myStats;
+  if (!stats) return '';
+  const months = lastMonths(h.month, 12);
+  const keys = Object.keys(KEY_NAMES);
+  const series = keys.filter(function (k) { return state.includeFixed || FIXED_KEYS.indexOf(k) < 0; }).map(function (k) {
+    const values = {};
+    months.forEach(function (m) { if (stats.byMonth[m] && stats.byMonth[m][k]) values[m] = stats.byMonth[m][k]; });
+    return { label: KEY_NAMES[k], color: CHART_COLORS[k], values: values };
+  });
+  const now = stats.byMonth[h.month] || {};
+  const rows = keys.filter(function (k) { return now[k]; }).map(function (k) {
+    return { label: KEY_NAMES[k], amount: now[k], color: CHART_COLORS[k] };
+  }).sort(function (a, b) { return b.amount - a.amount; });
+  return '<section class="section"><div class="chart-head"><h2 class="section-title">あなたの負担額の推移(全ルーム)</h2>' + fixedToggle() + '</div>' +
+    columnChart(months, series, 'あなたの負担額の推移') +
+    '<h4 class="chart-title">' + esc(monthLabel(h.month)) + 'のカテゴリ別</h4>' + hbarChart(rows) +
+    '</section>';
 }
 
 // ===== トースト(画面上部のお知らせ) =====
@@ -1776,7 +2284,7 @@ const ACTIONS = {
 
   'settle-all': async function () {
     const room = currentRoom();
-    if (!room) return;
+    if (!room || staleGuard(room.room.roomId)) return;
     const openPayments = room.payments.filter(function (p) { return p.status === 'open'; });
     const openTransfers = room.transfers.filter(function (t) { return t.status === 'open'; });
     const plan = planTransfers(computeBalances(openPayments, openTransfers), memberOrder(room));
@@ -1788,7 +2296,7 @@ const ACTIONS = {
 
   'settle-select': function () {
     const room = currentRoom();
-    if (room) openSelectSettlement(room.room.roomId);
+    if (room && !staleGuard(room.room.roomId)) openSelectSettlement(room.room.roomId);
   },
 
   'item-done': function (ds) {
@@ -1989,8 +2497,29 @@ const ACTIONS = {
     const roomId = room.room.roomId;
     saveAction('deleteRoom', { roomId: roomId }, {
       success: 'ルームを削除しました',
-      after: function () { delete state.rooms[roomId]; go('#/'); },
+      after: function () { delete state.rooms[roomId]; saveLocalCache(); go('#/'); },
     });
+  },
+
+  'refresh-room': async function () {
+    const room = currentRoom();
+    if (!room) return;
+    await loadRoom(room.room.roomId);
+    showToast('最新の内容にしました', 'ok');
+  },
+
+  'open-notifications': function () {
+    openNotifications();
+  },
+
+  'chart-filter': function (ds) {
+    state.chartFilter = ds.value;
+    render();
+  },
+
+  'toggle-fixed': function () {
+    state.includeFixed = !state.includeFixed;
+    render();
   },
 
   'cancel-join': function () {
@@ -2045,7 +2574,11 @@ document.addEventListener('submit', function (e) {
 });
 
 document.addEventListener('keydown', function (e) {
-  if (e.key === 'Escape') closeSheet();
+  if (e.key === 'Escape') {
+    const box = document.querySelector('.lightbox');
+    if (box) box.remove();
+    else closeSheet();
+  }
 });
 
 window.addEventListener('hashchange', route);
@@ -2054,5 +2587,17 @@ if (WIDE_QUERY.addEventListener) {
   WIDE_QUERY.addEventListener('change', function () { if (state.view.name === 'room') render(); });
 }
 
+(function () {
+  const indicator = document.createElement('div');
+  indicator.className = 'sync-indicator';
+  indicator.setAttribute('role', 'status');
+  indicator.textContent = '更新中…';
+  document.body.appendChild(indicator);
+})();
+setInterval(checkForChanges, CHECK_INTERVAL_MS);
+document.addEventListener('visibilitychange', function () { if (!document.hidden) checkForChanges(); });
+window.addEventListener('focus', checkForChanges);
+
+restoreLocalCache();
 onGoogleLibraryLoad();
 route();
