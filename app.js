@@ -117,6 +117,55 @@ function byDateDesc(a, b) {
   return (String(b.date) + String(b.createdAt)).localeCompare(String(a.date) + String(a.createdAt));
 }
 
+// ===== 家計簿の欄と、店名からのカテゴリ候補 =====
+
+const KAKEIBO_KEY_LABELS = {
+  other: '家具・家電 インテリア・日用品の欄',
+  food: '食費(アイス・デザート除く)の欄',
+  dining: '外食費の欄',
+  rent: '固定費の「家賃」',
+  gas: '固定費の「ガス」',
+  electric: '固定費の「電気」',
+  water: '固定費の「水道」',
+};
+// お店の種類ごとの名前の例。前に同じお店で登録したことがあれば、そちらを優先する
+const STORE_PATTERNS = [
+  { key: 'food', pattern: /まいばす|イオン|aeon|ライフ|西友|ヨーカ|サミット|オーケー|マルエツ|成城石井|業務スーパー|ベルク|ヤオコー|いなげや|東急ストア|コープ|生協|ロピア|ハナマサ|ピーコック|オオゼキ|ダイエー|マックスバリュ|スーパー/ },
+  { key: 'dining', pattern: /セブン|7-?11|ファミマ|ファミリーマート|ローソン|ミニストップ|デイリー|newdays|ニューデイズ|ポプラ|セイコーマート|uber|ウーバー|出前館|wolt|スタバ|スターバックス|ドトール|タリーズ|コメダ|マクド|マック|モス|ケンタッキー|すき家|吉野家|松屋|サイゼ|ガスト|餃子|ラーメン|居酒屋|寿司|鮨|カフェ|弁当|ほっともっと|オリジン|酒場|食堂|レストラン|ピザ|焼肉|そば|うどん|バインミー/ },
+  { key: 'other', pattern: /無印|ニトリ|ikea|イケア|ヨドバシ|ビック|ヤマダ|ケーズ|エディオン|ノジマ|ダイソー|セリア|キャンドゥ|ロフト|ハンズ|カインズ|コーナン|マツキヨ|マツモトキヨシ|ウエルシア|ツルハ|サンドラッグ|ココカラ|スギ薬局|ドラッグ|amazon|アマゾン|楽天|3coins|スリーコインズ|フランフラン|francfranc|ホームセンター/ },
+];
+
+function normalizeStore(text) {
+  return String(text === undefined || text === null ? '' : text).normalize('NFKC').trim().toLowerCase();
+}
+
+function categoryOf(room, categoryId) {
+  return room.categories.find(function (c) { return c.categoryId === categoryId; }) || null;
+}
+
+// 店名からカテゴリを選ぶ。前に同じ店で登録していればそのカテゴリ、なければお店の種類から
+function suggestCategory(room, title, excludePaymentId) {
+  const name = normalizeStore(title);
+  if (!name) return null;
+  const active = room.categories.filter(function (c) { return c.isActive; });
+  const past = room.payments.filter(function (p) {
+    return p.paymentId !== excludePaymentId && p.categoryId && normalizeStore(p.title) === name;
+  }).sort(byDateDesc)[0];
+  if (past && active.some(function (c) { return c.categoryId === past.categoryId; })) {
+    return { categoryId: past.categoryId, reason: 'history' };
+  }
+  const hit = STORE_PATTERNS.find(function (s) { return s.pattern.test(name); });
+  const cat = hit ? active.find(function (c) { return c.kakeiboKey === hit.key; }) : null;
+  return cat ? { categoryId: cat.categoryId, reason: 'store' } : null;
+}
+
+// 家計簿と連携しているルームで、カテゴリが家計簿のどの欄にも対応していない支払い
+function needsKakeiboCheck(room, p) {
+  if (!room.kakeibo || !room.kakeibo.configured) return false;
+  const c = categoryOf(room, p.categoryId);
+  return !c || !c.kakeiboKey;
+}
+
 // ===== 割り勘と精算の計算(処理のプログラムと同じ計算) =====
 
 function splitEqually(amount, payerId, participantIds) {
@@ -257,6 +306,7 @@ async function saveAction(action, params, opts) {
     if (opts.roomId) await loadRoom(opts.roomId);
     if (state.view.name === 'home') loadHome();
     showToast(opts.success || '保存しました', 'ok');
+    if (data && data.kakeiboWarning) showToast(data.kakeiboWarning, 'error');
     if (opts.after) opts.after(data);
     return data;
   } catch (e) {
@@ -611,10 +661,22 @@ function renderRecords(room) {
 }
 
 function paymentRow(room, p) {
+  let sub;
+  if (p.shares.length === 1) {
+    const only = p.shares[0].memberId;
+    sub = only === p.payerMemberId
+      ? memberName(room, only) + 'の個人'
+      : memberName(room, p.payerMemberId) + '立替・' + memberName(room, only) + 'の分';
+  } else {
+    sub = memberName(room, p.payerMemberId) + '立替・' + p.shares.length + '人で割り勘';
+  }
+  const tags = (p.fixedCostId ? '<span class="tag">固定費</span>' : '') +
+    (p.parts && p.parts.length ? '<span class="tag">分割</span>' : '') +
+    (needsKakeiboCheck(room, p) ? '<span class="tag warn">カテゴリを確認</span>' : '');
   return '<li><button type="button" class="row record" data-action="open-payment" data-id="' + esc(p.paymentId) + '">' +
     '<span class="row-date">' + esc(dateLabel(p.date)) + '</span>' +
     '<span class="row-main"><span class="row-title">' + esc(p.title) + '</span>' +
-    '<span class="row-sub">' + esc(memberName(room, p.payerMemberId)) + '立替・' + p.shares.length + '人で割り勘</span></span>' +
+    '<span class="row-sub">' + esc(sub) + '</span>' + (tags ? '<span class="tags">' + tags + '</span>' : '') + '</span>' +
     '<span class="row-end"><span class="row-amount">' + yen(p.amount) + '</span>' + statusChip(p.status) + '</span>' +
     '</button></li>';
 }
@@ -807,9 +869,26 @@ function renderSummary(room) {
     }).join('') +
     '</tbody></table></div>' +
     '<p class="muted small">負担額は割り勘で最終的に負担する額、立替額は実際に立て替えて払った額です。</p></section>' +
+    sharedPersonalHtml(room, inMonth) +
     '<section class="section"><h3 class="section-title">これまでの累計</h3><dl class="kv">' +
     '<div><dt>ルーム全体の使用額</dt><dd>' + yen(allTotal) + '</dd></div>' +
     '<div><dt>あなたの負担額</dt><dd>' + yen(myAll) + '</dd></div></dl></section>';
+}
+
+function sharedPersonalHtml(room, inMonth) {
+  const sharedTotal = sum(inMonth.filter(function (p) { return p.shares.length >= 2; }).map(function (p) { return p.amount; }));
+  const personal = room.members.map(function (m) {
+    return {
+      member: m,
+      total: sum(inMonth.filter(function (p) { return p.shares.length === 1 && p.shares[0].memberId === m.memberId; })
+        .map(function (p) { return p.amount; })),
+    };
+  }).filter(function (x) { return x.total || !x.member.left; });
+  return '<section class="section"><h3 class="section-title">共同と個人</h3><dl class="kv">' +
+    '<div><dt>共同(2人以上で割り勘)</dt><dd>' + yen(sharedTotal) + '</dd></div>' +
+    personal.map(function (x) {
+      return '<div><dt>' + esc(x.member.displayName) + 'の個人</dt><dd>' + yen(x.total) + '</dd></div>';
+    }).join('') + '</dl></section>';
 }
 
 // --- 設定 ---
@@ -837,6 +916,13 @@ function renderSettings(room) {
     '<section class="section"><div class="section-head"><h3 class="section-title">カテゴリ</h3>' +
     '<button type="button" class="btn small" data-action="add-category">' + ICONS.plus + '追加</button></div>' +
     '<ul class="list">' + room.categories.map(categoryRow).join('') + '</ul></section>' +
+    '<section class="section"><div class="section-head"><h3 class="section-title">固定費の自動登録</h3>' +
+    '<button type="button" class="btn small" data-action="add-fixed">' + ICONS.plus + '追加</button></div>' +
+    (room.fixedCosts.length
+      ? '<ul class="list">' + room.fixedCosts.map(function (f) { return fixedCostRow(room, f); }).join('') + '</ul>'
+      : '<p class="empty">家賃や光熱費などを登録しておくと、毎月決まった日に支払いとして自動で登録されます。</p>') +
+    '</section>' +
+    (room.isAppOwner ? kakeiboSection(room) : '') +
     '<section class="section"><h3 class="section-title">そのほか</h3><ul class="list">' +
     '<li><button type="button" class="row link" data-action="show-history"><span class="row-main"><span class="row-title">変更履歴を見る</span>' +
     '<span class="row-sub">誰がいつ何を追加・変更・削除したか</span></span><span class="chev">' + ICONS.chevron + '</span></button></li>' +
@@ -863,11 +949,46 @@ function memberRow(room, m) {
 }
 
 function categoryRow(c) {
+  const where = c.kakeiboKey ? '家計簿:' + KAKEIBO_KEY_LABELS[c.kakeiboKey] : '家計簿の欄に対応していません';
   return '<li><div class="row static"><span class="row-main"><span class="row-title' + (c.isActive ? '' : ' muted') + '">' + esc(c.name) +
-    (c.isActive ? '' : '(非表示)') + '</span></span>' +
-    '<span class="row-buttons"><button type="button" class="btn small ghost" data-action="rename-category" data-id="' + esc(c.categoryId) + '">名前を変更</button>' +
+    (c.isActive ? '' : '(非表示)') + '</span><span class="row-sub">' + esc(where) + '</span></span>' +
+    '<span class="row-buttons"><button type="button" class="btn small ghost" data-action="rename-category" data-id="' + esc(c.categoryId) + '">変更</button>' +
     '<button type="button" class="btn small ghost" data-action="toggle-category" data-id="' + esc(c.categoryId) + '">' + (c.isActive ? '隠す' : '表示する') + '</button>' +
     '</span></div></li>';
+}
+
+function fixedCostRow(room, f) {
+  const cat = categoryOf(room, f.categoryId);
+  return '<li><button type="button" class="row link" data-action="edit-fixed" data-id="' + esc(f.fixedCostId) + '">' +
+    '<span class="row-main"><span class="row-title' + (f.active ? '' : ' muted') + '">' + esc(f.title) + (f.active ? '' : '(停止中)') + '</span>' +
+    '<span class="row-sub">毎月' + (f.dayOfMonth >= 31 ? '末日' : f.dayOfMonth + '日') + '・' + esc(memberName(room, f.payerMemberId)) + 'が支払い・' +
+    esc(cat ? cat.name : 'カテゴリなし') + '</span></span>' +
+    '<span class="row-end"><span class="row-amount">' + yen(f.amount) + '</span></span></button></li>';
+}
+
+function kakeiboSection(room) {
+  const k = room.kakeibo || {};
+  let body;
+  if (k.configured) {
+    const sheets = [k.sharedSheet + '(共同)'].concat(Object.keys(k.memberSheets).map(function (id) {
+      return k.memberSheets[id] + '(' + memberName(room, id) + ')';
+    }));
+    body = '<p class="kakeibo-status ' + (k.enabled ? 'on' : 'off') + '">' + (k.enabled ? '自動反映:オン' : '自動反映:オフ(準備済み)') + '</p>' +
+      '<p class="muted small">反映先:' + esc(sheets.join('、')) + '</p>' +
+      '<div class="actions-row">' +
+      '<button type="button" class="btn' + (k.enabled ? '' : ' primary') + '" data-action="kakeibo-toggle">' + (k.enabled ? '自動反映を止める' : '自動反映を始める') + '</button>' +
+      (k.enabled ? '<button type="button" class="btn" data-action="kakeibo-sync">今すぐ家計簿に反映</button>' : '') +
+      '<a class="btn" href="' + esc(k.spreadsheetUrl) + '" target="_blank" rel="noopener">家計簿を開く</a></div>' +
+      '<div class="actions-row"><button type="button" class="btn small ghost" data-action="kakeibo-setup">連携の設定をやり直す</button>' +
+      '<button type="button" class="btn small ghost danger-text" data-action="kakeibo-remove">連携を解除</button></div>';
+  } else if (k.linkedElsewhere) {
+    body = '<p class="muted small">家計簿は、いまほかのルームと連携しています。</p>' +
+      '<div class="actions-row"><button type="button" class="btn" data-action="kakeibo-setup">このルームに切り替える</button></div>';
+  } else {
+    body = '<p class="muted small">このルームの記録を、家計簿のスプレッドシートへ自動で書き込みます。この設定は、アプリの管理者にだけ表示されています。</p>' +
+      '<div class="actions-row"><button type="button" class="btn primary" data-action="kakeibo-setup">このルームを家計簿と連携する</button></div>';
+  }
+  return '<section class="section"><h3 class="section-title">家計簿との連携</h3>' + body + '</section>';
 }
 
 // ===== シート(画面の下から出る入力欄) =====
@@ -961,24 +1082,43 @@ function openPaymentForm(roomId, existing, draft) {
     ? {
         date: existing.date, title: existing.title, amount: existing.amount, payerMemberId: existing.payerMemberId,
         participantMemberIds: existing.shares.map(function (s) { return s.memberId; }),
-        categoryId: existing.categoryId, memo: existing.memo,
+        categoryId: existing.categoryId, parts: (existing.parts || []).map(function (x) { return { categoryId: x.categoryId, amount: x.amount }; }),
+        memo: existing.memo,
       }
     : {
         date: defaultDate(), title: '', amount: '', payerMemberId: room.myMemberId,
-        participantMemberIds: active.map(function (m) { return m.memberId; }), categoryId: '', memo: '',
+        participantMemberIds: active.map(function (m) { return m.memberId; }), categoryId: '', parts: [], memo: '',
       });
   const locked = !!existing && existing.status !== 'open';
+  const kakeiboRoom = !!(room.kakeibo && room.kakeibo.configured);
   const shown = room.members.filter(function (m) {
     return !m.left || values.participantMemberIds.indexOf(m.memberId) >= 0 || m.memberId === values.payerMemberId;
   });
-  const categories = room.categories.filter(function (c) { return c.isActive || c.categoryId === values.categoryId; });
+  const usedIds = [values.categoryId].concat(values.parts.map(function (x) { return x.categoryId; }));
+  const categories = room.categories.filter(function (c) { return c.isActive || usedIds.indexOf(c.categoryId) >= 0; });
+  const categoryOptions = function (selected, withEmpty) {
+    return (withEmpty ? '<option value="">' + (kakeiboRoom ? '選んでください' : 'なし') + '</option>' : '') +
+      categories.map(function (c) {
+        return '<option value="' + esc(c.categoryId) + '"' + (c.categoryId === selected ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+      }).join('');
+  };
+  const partRow = function (part) {
+    return '<div class="part-row" data-part><select name="partCategory" aria-label="分けるカテゴリ">' + categoryOptions(part.categoryId, false) + '</select>' +
+      '<span class="amount-input"><input type="text" name="partAmount" inputmode="numeric" autocomplete="off" value="' + esc(part.amount) + '" placeholder="0" aria-label="分ける金額"><span>円</span></span>' +
+      '<button type="button" class="icon-btn" data-form-action="remove-part" aria-label="この分け方を消す">' + ICONS.close + '</button></div>';
+  };
 
   const body = '<form class="form" id="payment-form" novalidate>' +
     (locked ? '<p class="notice">' + esc(STATUS_LABELS[existing.status]) + 'のため直せません。直すときは、精算タブでこの精算を取り消してください。</p>' : '') +
     '<fieldset class="plain"' + (locked ? ' disabled' : '') + '>' +
     '<div class="field-row"><label class="field"><span>日付</span><input type="date" name="date" value="' + esc(values.date) + '" required></label>' +
     '<label class="field"><span>金額</span><span class="amount-input"><input type="text" name="amount" inputmode="numeric" autocomplete="off" value="' + esc(values.amount) + '" placeholder="0"><span>円</span></span></label></div>' +
-    '<label class="field"><span>内容</span><input type="text" name="title" maxlength="50" autocomplete="off" value="' + esc(values.title) + '" placeholder="例:スーパーの買い出し"></label>' +
+    '<label class="field"><span>お店・内容</span><input type="text" name="title" maxlength="50" autocomplete="off" value="' + esc(values.title) + '" placeholder="例:まいばすけっと"></label>' +
+    '<div class="field"><span>カテゴリ' + (kakeiboRoom ? '(必須)' : '') + '</span><select name="category" aria-label="カテゴリ">' + categoryOptions(values.categoryId, true) + '</select>' +
+    '<p class="hint" data-category-hint></p>' +
+    '<div class="parts" data-parts>' + values.parts.map(partRow).join('') + '</div>' +
+    '<p class="hint" data-remainder></p>' +
+    '<div><button type="button" class="btn small ghost" data-form-action="add-part">' + ICONS.plus + '別のカテゴリに分ける</button></div></div>' +
     '<label class="field"><span>立て替えた人</span><select name="payer">' + shown.map(function (m) {
       return '<option value="' + esc(m.memberId) + '"' + (m.memberId === values.payerMemberId ? ' selected' : '') + '>' + esc(m.displayName) + '</option>';
     }).join('') + '</select></label>' +
@@ -986,9 +1126,6 @@ function openPaymentForm(roomId, existing, draft) {
       const on = values.participantMemberIds.indexOf(m.memberId) >= 0;
       return '<label class="chip-toggle"><input type="checkbox" name="participant" value="' + esc(m.memberId) + '"' + (on ? ' checked' : '') + '><span>' + esc(m.displayName) + '</span></label>';
     }).join('') + '</div><p class="hint" data-per-person></p></div>' +
-    '<label class="field"><span>カテゴリ</span><select name="category"><option value="">なし</option>' + categories.map(function (c) {
-      return '<option value="' + esc(c.categoryId) + '"' + (c.categoryId === values.categoryId ? ' selected' : '') + '>' + esc(c.name) + '</option>';
-    }).join('') + '</select></label>' +
     '<label class="field"><span>メモ</span><textarea name="memo" rows="2" maxlength="500">' + esc(values.memo) + '</textarea></label>' +
     '</fieldset>' +
     '<p class="form-error" role="alert"></p>' +
@@ -1005,6 +1142,9 @@ function openPaymentForm(roomId, existing, draft) {
   openSheet(existing ? '支払い' : '支払いを登録', body, function (sheet) {
     const form = sheet.querySelector('#payment-form');
     const hint = form.querySelector('[data-per-person]');
+    const categoryHint = form.querySelector('[data-category-hint]');
+    const remainder = form.querySelector('[data-remainder]');
+    let categoryTouched = !!existing || !!draft;
     const read = function () {
       return {
         date: form.elements.date.value,
@@ -1014,29 +1154,72 @@ function openPaymentForm(roomId, existing, draft) {
         participantMemberIds: Array.prototype.filter.call(form.querySelectorAll('input[name="participant"]'), function (el) { return el.checked; })
           .map(function (el) { return el.value; }),
         categoryId: form.elements.category.value,
+        parts: Array.prototype.map.call(form.querySelectorAll('[data-part]'), function (row) {
+          return { categoryId: row.querySelector('[name="partCategory"]').value, amount: parseAmount(row.querySelector('[name="partAmount"]').value) };
+        }),
         memo: form.elements.memo.value.trim(),
       };
     };
-    const updateHint = function () {
+    const updateHints = function () {
       const v = read();
-      if (!(v.amount > 0) || !v.participantMemberIds.length) { hint.textContent = ''; return; }
-      const shares = splitEqually(v.amount, v.payerMemberId, v.participantMemberIds);
-      const base = Math.floor(v.amount / v.participantMemberIds.length);
-      const extra = shares.find(function (s) { return s.amount !== base; });
-      hint.textContent = '1人あたり ' + yen(base) + (extra ? '(端数の' + yen(extra.amount - base) + 'は' + memberName(room, extra.memberId) + 'が負担)' : '');
+      if (!(v.amount > 0) || !v.participantMemberIds.length) {
+        hint.textContent = '';
+      } else {
+        const shares = splitEqually(v.amount, v.payerMemberId, v.participantMemberIds);
+        const base = Math.floor(v.amount / v.participantMemberIds.length);
+        const extra = shares.find(function (s) { return s.amount !== base; });
+        hint.textContent = '1人あたり ' + yen(base) + (extra ? '(端数の' + yen(extra.amount - base) + 'は' + memberName(room, extra.memberId) + 'が負担)' : '');
+      }
+      if (!v.parts.length) {
+        remainder.textContent = '';
+      } else if (!(v.amount > 0)) {
+        remainder.textContent = '金額を入れると、元のカテゴリに残る額を表示します';
+      } else {
+        const used = sum(v.parts.map(function (x) { return x.amount > 0 ? x.amount : 0; }));
+        const main = categoryOf(room, v.categoryId);
+        remainder.textContent = (main ? '「' + main.name + '」' : '元のカテゴリ') + 'には、残りの ' + yen(v.amount - used) + ' が入ります';
+      }
     };
-    form.addEventListener('input', updateHint);
-    form.addEventListener('change', updateHint);
-    updateHint();
+    const applySuggestion = function () {
+      if (categoryTouched || locked) return;
+      const s = suggestCategory(room, form.elements.title.value, existing ? existing.paymentId : '');
+      if (s) {
+        form.elements.category.value = s.categoryId;
+        categoryHint.textContent = s.reason === 'history' ? '前に同じお店で選んだカテゴリにしました(変えられます)' : 'お店の種類からカテゴリを選びました(変えられます)';
+      } else {
+        categoryHint.textContent = '';
+      }
+      updateHints();
+    };
+    let timer = null;
+    form.elements.title.addEventListener('input', function () {
+      clearTimeout(timer);
+      timer = setTimeout(applySuggestion, 250);
+    });
+    form.elements.title.addEventListener('change', applySuggestion);
+    form.elements.category.addEventListener('change', function () {
+      categoryTouched = true;
+      categoryHint.textContent = '';
+    });
+    form.addEventListener('input', updateHints);
+    form.addEventListener('change', updateHints);
+    updateHints();
 
     form.addEventListener('submit', function (e) {
       e.preventDefault();
       if (locked) return;
       const v = read();
+      const partIds = v.parts.map(function (x) { return x.categoryId; });
+      const partsTotal = sum(v.parts.map(function (x) { return x.amount > 0 ? x.amount : 0; }));
       const error = !v.date ? '日付を入力してください'
         : !(v.amount > 0) ? '金額を数字で入力してください'
         : v.amount > 10000000 ? '金額は1,000万円までです'
-        : !v.title ? '内容を入力してください'
+        : !v.title ? 'お店・内容を入力してください'
+        : kakeiboRoom && !v.categoryId ? 'カテゴリを選んでください'
+        : v.parts.some(function (x) { return !(x.amount > 0); }) ? '分ける金額を数字で入力してください'
+        : v.parts.length && !v.categoryId ? '分けるときは、元のカテゴリも選んでください'
+        : partIds.some(function (id, i) { return id === v.categoryId || partIds.indexOf(id) !== i; }) ? '同じカテゴリには2回分けられません'
+        : v.parts.length && partsTotal >= v.amount ? '分ける金額の合計は、支払いの金額より小さくしてください'
         : !v.participantMemberIds.length ? '対象メンバーを1人以上選んでください'
         : '';
       if (error) { form.querySelector('.form-error').textContent = error; return; }
@@ -1052,7 +1235,18 @@ function openPaymentForm(roomId, existing, draft) {
       const btn = e.target.closest('[data-form-action]');
       if (!btn) return;
       const act = btn.dataset.formAction;
-      if (act === 'go-settle') {
+      if (act === 'add-part') {
+        const v = read();
+        const taken = [v.categoryId].concat(v.parts.map(function (x) { return x.categoryId; }));
+        const free = categories.find(function (c) { return c.isActive && taken.indexOf(c.categoryId) < 0; });
+        form.querySelector('[data-parts]').insertAdjacentHTML('beforeend', partRow({ categoryId: free ? free.categoryId : '', amount: '' }));
+        const inputs = form.querySelectorAll('[name="partAmount"]');
+        if (inputs.length) inputs[inputs.length - 1].focus();
+        updateHints();
+      } else if (act === 'remove-part') {
+        btn.closest('[data-part]').remove();
+        updateHints();
+      } else if (act === 'go-settle') {
         closeSheet();
         go('#/room/' + encodeURIComponent(roomId) + '/settle');
       } else if (act === 'delete') {
@@ -1068,7 +1262,174 @@ function openPaymentForm(roomId, existing, draft) {
   });
 }
 
-// --- お金の受け渡しの入力 ---
+// --- カテゴリの追加・変更 ---
+
+function openCategoryForm(roomId, existing) {
+  const room = state.rooms[roomId];
+  if (!room) return;
+  const key = existing ? existing.kakeiboKey : 'other';
+  const body = '<form class="form" id="category-form" novalidate>' +
+    '<label class="field"><span>カテゴリ名</span><input type="text" name="name" maxlength="20" autocomplete="off" value="' + esc(existing ? existing.name : '') + '" placeholder="例:医療"></label>' +
+    '<label class="field"><span>家計簿で入る欄</span><select name="key">' +
+    Object.keys(KAKEIBO_KEY_LABELS).map(function (k) {
+      return '<option value="' + k + '"' + (k === key ? ' selected' : '') + '>' + esc(KAKEIBO_KEY_LABELS[k]) + '</option>';
+    }).join('') +
+    '<option value=""' + (key === '' ? ' selected' : '') + '>対応させない(家具・家電 インテリア・日用品の欄に入ります)</option></select></label>' +
+    '<p class="form-error" role="alert"></p><div class="form-actions"><button type="submit" class="btn primary">' + (existing ? '変更する' : '追加する') + '</button></div></form>';
+  openSheet(existing ? 'カテゴリを変更' : 'カテゴリを追加', body, function (sheet) {
+    const form = sheet.querySelector('#category-form');
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      const name = form.elements.name.value.trim();
+      if (!name) { form.querySelector('.form-error').textContent = 'カテゴリ名を入力してください'; return; }
+      closeSheet();
+      saveAction('saveCategory', { roomId: roomId, categoryId: existing ? existing.categoryId : '', name: name, kakeiboKey: form.elements.key.value }, {
+        roomId: roomId, success: existing ? 'カテゴリを変更しました' : 'カテゴリを追加しました',
+      });
+    });
+  });
+}
+
+// --- 固定費の登録・変更 ---
+
+function openFixedCostForm(roomId, existing) {
+  const room = state.rooms[roomId];
+  if (!room) return;
+  const active = room.members.filter(function (m) { return !m.left; });
+  const v = existing
+    ? { title: existing.title, amount: existing.amount, categoryId: existing.categoryId, payerMemberId: existing.payerMemberId,
+        participantMemberIds: existing.participantMemberIds, dayOfMonth: existing.dayOfMonth, active: existing.active }
+    : { title: '', amount: '', categoryId: '', payerMemberId: room.myMemberId,
+        participantMemberIds: active.map(function (m) { return m.memberId; }), dayOfMonth: 1, active: true };
+  const shown = room.members.filter(function (m) {
+    return !m.left || v.participantMemberIds.indexOf(m.memberId) >= 0 || m.memberId === v.payerMemberId;
+  });
+  const categories = room.categories.filter(function (c) { return c.isActive || c.categoryId === v.categoryId; });
+  const days = [];
+  for (let d = 1; d <= 31; d++) {
+    days.push('<option value="' + d + '"' + (d === v.dayOfMonth ? ' selected' : '') + '>' + (d === 31 ? '月末(31日)' : d + '日') + '</option>');
+  }
+  const body = '<form class="form" id="fixed-form" novalidate>' +
+    '<p class="muted small">毎月の登録日に、支払いとして自動で登録します。光熱費のように毎月金額が変わるものは、登録されたあとに金額を直してください。</p>' +
+    '<label class="field"><span>カテゴリ</span><select name="category"><option value="">選んでください</option>' + categories.map(function (c) {
+      return '<option value="' + esc(c.categoryId) + '"' + (c.categoryId === v.categoryId ? ' selected' : '') + '>' + esc(c.name) + '</option>';
+    }).join('') + '</select></label>' +
+    '<div class="field-row"><label class="field"><span>内容</span><input type="text" name="title" maxlength="50" autocomplete="off" value="' + esc(v.title) + '" placeholder="例:家賃"></label>' +
+    '<label class="field"><span>金額</span><span class="amount-input"><input type="text" name="amount" inputmode="numeric" autocomplete="off" value="' + esc(v.amount) + '" placeholder="0"><span>円</span></span></label></div>' +
+    '<div class="field-row"><label class="field"><span>支払う人</span><select name="payer">' + shown.map(function (m) {
+      return '<option value="' + esc(m.memberId) + '"' + (m.memberId === v.payerMemberId ? ' selected' : '') + '>' + esc(m.displayName) + '</option>';
+    }).join('') + '</select></label>' +
+    '<label class="field"><span>毎月の登録日</span><select name="day">' + days.join('') + '</select></label></div>' +
+    '<div class="field"><span>対象メンバー</span><div class="chips">' + shown.map(function (m) {
+      const on = v.participantMemberIds.indexOf(m.memberId) >= 0;
+      return '<label class="chip-toggle"><input type="checkbox" name="participant" value="' + esc(m.memberId) + '"' + (on ? ' checked' : '') + '><span>' + esc(m.displayName) + '</span></label>';
+    }).join('') + '</div></div>' +
+    (existing
+      ? '<label class="check-line"><input type="checkbox" name="active"' + (v.active ? ' checked' : '') + '><span>自動登録を続ける(外すと止まります)</span></label>'
+      : '<fieldset class="field"><legend>いつから登録しますか</legend><div class="radio-list">' +
+        '<label class="radio"><input type="radio" name="start" value="this" checked><span>今月から(登録日を過ぎていれば、すぐに今月分を登録)</span></label>' +
+        '<label class="radio"><input type="radio" name="start" value="next"><span>来月から(今月分は自分で入力済み)</span></label></div></fieldset>') +
+    '<p class="form-error" role="alert"></p><div class="form-actions"><button type="submit" class="btn primary">' + (existing ? '保存する' : '登録する') + '</button>' +
+    (existing ? '<button type="button" class="btn ghost danger-text" data-form-action="delete">削除</button>' : '') + '</div></form>';
+
+  openSheet(existing ? '固定費' : '固定費を登録', body, function (sheet) {
+    const form = sheet.querySelector('#fixed-form');
+    form.elements.category.addEventListener('change', function () {
+      const c = categoryOf(room, form.elements.category.value);
+      if (c && !form.elements.title.value.trim()) form.elements.title.value = c.name;
+    });
+    form.addEventListener('submit', function (e) {
+      e.preventDefault();
+      const params = {
+        roomId: roomId,
+        fixedCostId: existing ? existing.fixedCostId : '',
+        categoryId: form.elements.category.value,
+        title: form.elements.title.value.trim(),
+        amount: parseAmount(form.elements.amount.value),
+        payerMemberId: form.elements.payer.value,
+        dayOfMonth: Number(form.elements.day.value),
+        participantMemberIds: Array.prototype.filter.call(form.querySelectorAll('input[name="participant"]'), function (el) { return el.checked; })
+          .map(function (el) { return el.value; }),
+      };
+      if (existing) params.active = form.elements.active.checked;
+      else params.startThisMonth = form.querySelector('input[name="start"]:checked').value === 'this';
+      const error = !params.categoryId ? 'カテゴリを選んでください'
+        : !params.title ? '内容を入力してください'
+        : !(params.amount > 0) ? '金額を数字で入力してください'
+        : !params.participantMemberIds.length ? '対象メンバーを1人以上選んでください'
+        : '';
+      if (error) { form.querySelector('.form-error').textContent = error; return; }
+      closeSheet();
+      saveAction('saveFixedCost', params, {
+        roomId: roomId,
+        success: existing ? '固定費を変更しました' : '固定費を登録しました',
+        after: function (data) { if (data && data.created) showToast('今月分の「' + params.title + '」を支払いとして登録しました', 'ok'); },
+      });
+    });
+    form.addEventListener('click', async function (e) {
+      const btn = e.target.closest('[data-form-action="delete"]');
+      if (!btn) return;
+      const ok = await confirmSheet('固定費を削除', '「' + esc(existing.title) + '」の自動登録をやめます。これまでに登録された支払いは残ります。', '削除する', true);
+      if (ok) saveAction('deleteFixedCost', { fixedCostId: existing.fixedCostId }, { roomId: roomId, success: '固定費を削除しました' });
+    });
+  });
+}
+
+// --- 家計簿との連携(管理者だけ) ---
+
+async function openKakeiboSetup(roomId) {
+  const room = state.rooms[roomId];
+  if (!room) return;
+  openSheet('家計簿との連携', '<p class="loading">家計簿を確認しています…</p>');
+  let info;
+  try {
+    info = await api('getKakeibo', { roomId: roomId });
+  } catch (e) {
+    const failed = document.querySelector('#sheet-root .sheet-body');
+    if (failed && e.code !== 'AUTH_REQUIRED') failed.innerHTML = '<p class="notice error">' + esc(e.message) + '</p>';
+    return;
+  }
+  const body = document.querySelector('#sheet-root .sheet-body');
+  if (!body) return;
+  const cfg = info.config && info.config.roomId === roomId ? info.config : null;
+  const options = function (selected) {
+    return '<option value="">なし</option>' + info.sheetNames.map(function (n) {
+      return '<option value="' + esc(n) + '"' + (n === selected ? ' selected' : '') + '>' + esc(n) + '</option>';
+    }).join('');
+  };
+  const sharedGuess = cfg ? cfg.sharedSheet : (info.sheetNames.find(function (n) { return /共同/.test(n); }) || '');
+  const memberGuess = function (m) {
+    if (cfg && cfg.memberSheets && cfg.memberSheets[m.memberId]) return cfg.memberSheets[m.memberId];
+    const name = normalizeStore(m.displayName);
+    return info.sheetNames.find(function (n) { return /個人/.test(n) && name && normalizeStore(n).indexOf(name) === 0; }) || '';
+  };
+  const active = room.members.filter(function (m) { return !m.left; });
+  body.innerHTML = '<form class="form" id="kakeibo-form" novalidate>' +
+    '<p class="sheet-message">家計簿「' + esc(info.spreadsheetName) + '」と連携します。各シートの一番上に「表示する月」の行を追加します。</p>' +
+    '<label class="field"><span>2人で割り勘した支払いを入れるシート</span><select name="shared">' + options(sharedGuess) + '</select></label>' +
+    active.map(function (m) {
+      return '<label class="field"><span>' + esc(m.displayName) + 'の個人の支払いを入れるシート</span>' +
+        '<select name="member" data-member="' + esc(m.memberId) + '">' + options(memberGuess(m)) + '</select></label>';
+    }).join('') +
+    '<p class="muted small">準備をしても、自動反映がオフのあいだは家計簿を書き換えません。今月分の記録をアプリに入れ終えてから「自動反映を始める」を押してください。</p>' +
+    '<p class="form-error" role="alert"></p><div class="form-actions"><button type="submit" class="btn primary">連携の準備をする</button></div></form>';
+  const form = body.querySelector('#kakeibo-form');
+  form.addEventListener('submit', function (e) {
+    e.preventDefault();
+    const sharedSheet = form.elements.shared.value;
+    const memberSheets = {};
+    form.querySelectorAll('select[name="member"]').forEach(function (el) { if (el.value) memberSheets[el.dataset.member] = el.value; });
+    const chosen = [sharedSheet].concat(Object.keys(memberSheets).map(function (k) { return memberSheets[k]; }));
+    const error = !sharedSheet ? '2人で割り勘した支払いを入れるシートを選んでください'
+      : chosen.some(function (n, i) { return chosen.indexOf(n) !== i; }) ? '同じシートを2回選ぶことはできません'
+      : '';
+    if (error) { form.querySelector('.form-error').textContent = error; return; }
+    closeSheet();
+    saveAction('setupKakeibo', { roomId: roomId, spreadsheetId: info.spreadsheetId, sharedSheet: sharedSheet, memberSheets: memberSheets }, {
+      roomId: roomId, success: '家計簿との連携の準備ができました',
+    });
+  });
+}
 
 function openTransferForm(roomId, existing, draft) {
   const room = state.rooms[roomId];
@@ -1281,6 +1642,13 @@ function describeHistory(room, h) {
     case 'transfer:delete': return '受け渡し' + tr(b) + 'を削除しました';
     case 'settlement:create': return '精算を始めました(送金' + ((a.transfers || []).length) + '件)';
     case 'settlement:cancel': return '精算を取り消しました';
+    case 'fixed_cost:create': return '固定費「' + (a.title || '') + ' ' + yen(a.amount) + '」を登録しました';
+    case 'fixed_cost:update': return '固定費「' + (a.title || '') + '」を変更しました';
+    case 'fixed_cost:delete': return '固定費「' + (b.title || '') + '」を削除しました';
+    case 'kakeibo:setup': return '家計簿との連携を設定しました';
+    case 'kakeibo:enable': return '家計簿への自動反映を始めました';
+    case 'kakeibo:disable': return '家計簿への自動反映を止めました';
+    case 'kakeibo:remove': return '家計簿との連携を解除しました';
     case 'settlement_item:pay':
       if (a.status === 'done') return '送金を完了にしました';
       if (a.status === 'waiting') return '送金を未払いに戻しました';
@@ -1531,22 +1899,61 @@ const ACTIONS = {
     if (ok) saveAction('removeMember', { memberId: m.memberId }, { roomId: room.room.roomId, success: m.displayName + 'を外しました' });
   },
 
-  'add-category': async function () {
+  'add-category': function () {
     const room = currentRoom();
-    if (!room) return;
-    const name = await promptSheet('カテゴリを追加', 'カテゴリ名', '', { placeholder: '例:医療', okLabel: '追加する', maxlength: 20 });
-    if (name === null) return;
-    saveAction('saveCategory', { roomId: room.room.roomId, name: name }, { roomId: room.room.roomId, success: 'カテゴリを追加しました' });
+    if (room) openCategoryForm(room.room.roomId);
   },
 
-  'rename-category': async function (ds) {
+  'rename-category': function (ds) {
     const room = currentRoom();
     if (!room) return;
     const c = room.categories.find(function (x) { return x.categoryId === ds.id; });
-    if (!c) return;
-    const name = await promptSheet('カテゴリ名を変更', 'カテゴリ名', c.name, { okLabel: '変更する', maxlength: 20 });
-    if (name === null || name === c.name) return;
-    saveAction('saveCategory', { roomId: room.room.roomId, categoryId: c.categoryId, name: name }, { roomId: room.room.roomId, success: 'カテゴリ名を変えました' });
+    if (c) openCategoryForm(room.room.roomId, c);
+  },
+
+  'add-fixed': function () {
+    const room = currentRoom();
+    if (room) openFixedCostForm(room.room.roomId);
+  },
+
+  'edit-fixed': function (ds) {
+    const room = currentRoom();
+    if (!room) return;
+    const f = room.fixedCosts.find(function (x) { return x.fixedCostId === ds.id; });
+    if (f) openFixedCostForm(room.room.roomId, f);
+  },
+
+  'kakeibo-setup': function () {
+    const room = currentRoom();
+    if (room) openKakeiboSetup(room.room.roomId);
+  },
+
+  'kakeibo-toggle': async function () {
+    const room = currentRoom();
+    if (!room) return;
+    const turnOn = !room.kakeibo.enabled;
+    if (turnOn) {
+      const ok = await confirmSheet('自動反映を始める',
+        '<p>家計簿の各シートを、「表示する月」のアプリの記録で書き直します。</p>' +
+        '<p>家計簿にしかない記録は消えるので、先にアプリへ入れておいてください。</p>', '始める', false);
+      if (!ok) return;
+    }
+    saveAction('setKakeiboEnabled', { enabled: turnOn }, {
+      roomId: room.room.roomId,
+      success: turnOn ? '自動反映を始めました。家計簿を開いて確かめてください' : '自動反映を止めました',
+    });
+  },
+
+  'kakeibo-sync': function () {
+    saveAction('syncKakeibo', {}, { success: '家計簿に反映しました' });
+  },
+
+  'kakeibo-remove': async function () {
+    const room = currentRoom();
+    if (!room) return;
+    const ok = await confirmSheet('連携を解除',
+      '<p>家計簿への自動反映をやめます。家計簿の内容とアプリの記録は、どちらも消えません。</p>', '解除する', true);
+    if (ok) saveAction('removeKakeibo', {}, { roomId: room.room.roomId, success: '家計簿との連携を解除しました' });
   },
 
   'toggle-category': function (ds) {

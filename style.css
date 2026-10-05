@@ -618,3 +618,14 @@ fieldset:disabled input, fieldset:disabled select, fieldset:disabled textarea { 
   .summary-split.three { grid-template-columns: minmax(0, 1fr); }
   .row-date { width: 3.1rem; }
 }
+
+/* ===== 家計簿連携アップデートで追加 ===== */
+.parts { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.5rem; }
+.parts:empty { display: none; }
+.part-row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 8.5rem) 40px; gap: 0.5rem; align-items: center; }
+.tag.warn { background: var(--amber-soft); color: var(--amber); }
+.kakeibo-status { display: inline-flex; margin: 0 0 0.25rem; padding: 0.2rem 0.75rem; border-radius: 999px; font-weight: 700; font-size: 0.9rem; }
+.kakeibo-status.on { background: var(--accent-soft); color: var(--accent); }
+.kakeibo-status.off { background: var(--surface-2); color: var(--muted); }
+.check-line { display: flex; align-items: center; gap: 0.6rem; }
+.check-line input { width: 20px; height: 20px; accent-color: var(--accent); }
